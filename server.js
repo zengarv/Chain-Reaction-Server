@@ -49,7 +49,7 @@ io.on('connection', (socket) => {
 
     // Broadcast a system chat message.
     io.to(roomId).emit('chatMessage', {
-      playerId: 'system',
+      playerId: 'Server',
       text: `${playerName} has joined the room.`,
       timestamp: new Date()
     });
@@ -75,7 +75,7 @@ io.on('connection', (socket) => {
         const removedPlayer = room.players.splice(index, 1)[0];
         io.to(roomId).emit('playerListUpdate', room.players);
         io.to(roomId).emit('chatMessage', {
-          playerId: 'system',
+          playerId: 'Server',
           text: `${removedPlayer.name} has left the room.`,
           timestamp: new Date()
         });
