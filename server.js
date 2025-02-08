@@ -13,18 +13,23 @@ const io = new Server(server, {
   }
 });
 
-// In‑memory storage for rooms: each room stores a list of players.
+// In‑memory storage for rooms: each room stores a list of players and grid settings.
 const rooms = {};
 
-// Listen for new connections.
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
   socket.on('joinRoom', (data) => {
-    const { roomId, playerName, isAdmin } = data;
+    // --- NEW/UPDATED LINES:
+    const { roomId, playerName, isAdmin, gridSize } = data;
     if (!rooms[roomId]) {
-      rooms[roomId] = { players: [] };
+      // If no grid size is passed, fall back to default
+      rooms[roomId] = { 
+        players: [],
+        gridSize: gridSize || { rows: 9, cols: 6 } 
+      };
     }
+    // -------------------------
 
     // Prevent duplicate joining (e.g. from React StrictMode re‑mounts)
     if (rooms[roomId].players.find(p => p.id === socket.id)) {
@@ -36,13 +41,16 @@ io.on('connection', (socket) => {
       id: socket.id,
       name: playerName,
       isAdmin: !!isAdmin  // true for admin, false otherwise
-      // Additional properties (e.g., color) can be added here.
     };
 
-    // Add the new player to the room and have the socket join the room.
     rooms[roomId].players.push(newPlayer);
     socket.join(roomId);
     console.log(`Player ${playerName} joined room ${roomId}`);
+
+    // --- NEW/UPDATED LINES:
+    // Emit the grid size to the new client so that its board matches the admin’s settings.
+    socket.emit('gridSizeUpdate', rooms[roomId].gridSize);
+    // -------------------------
 
     // Broadcast the updated players list.
     io.to(roomId).emit('playerListUpdate', rooms[roomId].players);
@@ -55,7 +63,15 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Listen for chat messages.
+  // Optional: Allow the admin to update the grid size (if needed) and broadcast to all players.
+  socket.on('setGridSize', (data) => {
+    const { roomId, gridSize } = data;
+    if (rooms[roomId]) {
+      rooms[roomId].gridSize = gridSize;
+      io.to(roomId).emit('gridSizeUpdate', gridSize);
+    }
+  });
+
   socket.on('sendChatMessage', (data) => {
     const { roomId, message, playerName } = data;
     io.to(roomId).emit('chatMessage', {
@@ -65,7 +81,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // When a client disconnects, remove it from any rooms.
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
     for (const roomId in rooms) {
