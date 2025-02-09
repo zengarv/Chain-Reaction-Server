@@ -13,46 +13,191 @@ const io = new Server(server, {
   }
 });
 
-// In‑memory storage for rooms: each room stores a list of players and grid settings.
+// In‑memory storage for rooms. Each room now has players, gridSize,
+// board (a 2D array of cell objects), currentTurn (index into players),
+// and a gameStarted flag.
 const rooms = {};
+
+// ---------------------
+// Helper Functions
+// ---------------------
+
+// Create an empty board and initialize game state.
+function initializeGame(room) {
+  const { rows, cols } = room.gridSize;
+  room.board = [];
+  for (let i = 0; i < rows; i++) {
+    room.board[i] = [];
+    for (let j = 0; j < cols; j++) {
+      room.board[i][j] = { count: 0, owner: null };
+    }
+  }
+  room.currentTurn = 0; // start with the first player in the list
+  room.gameStarted = true;
+}
+
+// Given a cell position (row, col) and the board dimensions,
+// return its critical mass (i.e. the number of neighbors).
+function getCriticalMass(row, col, gridSize) {
+  let count = 0;
+  if (row > 0) count++;                      // Up
+  if (row < gridSize.rows - 1) count++;        // Down
+  if (col > 0) count++;                      // Left
+  if (col < gridSize.cols - 1) count++;        // Right
+  return count;
+}
+
+// Process a move in a room. (Only the current player may make a move,
+// and a move is valid only if the targeted cell is either empty or already owned.)
+function processMove(room, playerSocketId, row, col) {
+  if (!room.gameStarted) {
+    return { error: "Game is not active" };
+  }
+  // Check if it is the turn of the player who sent the move.
+  let currentPlayer = room.players[room.currentTurn];
+  if (currentPlayer.id !== playerSocketId) {
+    return { error: "Not your turn" };
+  }
+
+  // Validate the move: the cell must be either empty or already owned by the current player.
+  let cell = room.board[row][col];
+  if (cell.owner !== null && cell.owner !== playerSocketId) {
+    return { error: "Invalid move" };
+  }
+  
+  // Place an orb into the cell.
+  cell.count += 1;
+  cell.owner = playerSocketId;
+
+  // Mark that the current player has now played.
+  currentPlayer.hasPlayed = true;
+  
+  // Process chain reactions using a queue.
+  let queue = [];
+  if (cell.count >= getCriticalMass(row, col, room.gridSize)) {
+    queue.push({ row, col });
+  }
+  
+  while (queue.length > 0) {
+    let { row: r, col: c } = queue.shift();
+    let currentCell = room.board[r][c];
+    let threshold = getCriticalMass(r, c, room.gridSize);
+    if (currentCell.count < threshold) continue; // might have been updated already
+    let owner = currentCell.owner;
+    
+    // Explosion: reset the cell.
+    currentCell.count = 0;
+    currentCell.owner = null;
+    
+    // For each neighbor, add an orb and change its owner.
+    const directions = [ [1,0], [-1,0], [0,1], [0,-1] ];
+    for (let [dr, dc] of directions) {
+      let nr = r + dr, nc = c + dc;
+      if (nr >= 0 && nr < room.gridSize.rows && nc >= 0 && nc < room.gridSize.cols) {
+        let neighbor = room.board[nr][nc];
+        neighbor.count += 1;
+        neighbor.owner = owner;
+        if (neighbor.count >= getCriticalMass(nr, nc, room.gridSize)) {
+          queue.push({ row: nr, col: nc });
+        }
+      }
+    }
+  }
+  
+  // Update each player’s "active" status.
+  // For players who haven't played yet, consider them active by default.
+  room.players.forEach(player => {
+    if (!player.hasPlayed) {
+      player.isActive = true;
+    } else {
+      player.isActive = false;
+    }
+  });
+  // Then, for each cell on the board, mark the owner as active.
+  for (let i = 0; i < room.gridSize.rows; i++) {
+    for (let j = 0; j < room.gridSize.cols; j++) {
+      let cell = room.board[i][j];
+      if (cell.owner) {
+        let player = room.players.find(p => p.id === cell.owner);
+        if (player) {
+          player.isActive = true;
+        }
+      }
+    }
+  }
+  
+  // Check for win condition only if at least two players have played.
+  let playersWhoPlayed = room.players.filter(p => p.hasPlayed);
+  let winner = null;
+  if (playersWhoPlayed.length > 1) {
+    let activePlayers = room.players.filter(p => p.isActive);
+    if (activePlayers.length === 1) {
+      winner = activePlayers[0];
+      room.gameStarted = false;
+    }
+  }
+  
+  // Update turn: advance to the next active player.
+  let nextTurn = room.currentTurn;
+  for (let i = 0; i < room.players.length; i++) {
+    nextTurn = (nextTurn + 1) % room.players.length;
+    if (room.players[nextTurn].isActive) {
+      break;
+    }
+  }
+  room.currentTurn = nextTurn;
+  
+  return {
+    board: room.board,
+    currentTurn: room.players[room.currentTurn].id,
+    players: room.players,
+    winner: winner
+  };
+}
+
+// ---------------------
+// Socket.io Event Handlers
+// ---------------------
 
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
   socket.on('joinRoom', (data) => {
-    // --- NEW/UPDATED LINES:
+    
     const { roomId, playerName, isAdmin, gridSize } = data;
     if (!rooms[roomId]) {
-      // If no grid size is passed, fall back to default
-      rooms[roomId] = { 
+      // If the room is new, initialize it with default grid settings.
+      rooms[roomId] = {
         players: [],
-        gridSize: gridSize || { rows: 9, cols: 6 } 
+        gridSize: gridSize || { rows: 9, cols: 6 },
+        board: [],
+        currentTurn: 0,
+        gameStarted: false
       };
     }
-    // -------------------------
 
-    // Prevent duplicate joining (e.g. from React StrictMode re‑mounts)
+    // Prevent duplicate joining.
     if (rooms[roomId].players.find(p => p.id === socket.id)) {
       return;
     }
 
-    // Create the player object.
+    // Create a new player object.
     const newPlayer = {
       id: socket.id,
       name: playerName,
-      isAdmin: !!isAdmin  // true for admin, false otherwise
+      isAdmin: !!isAdmin,  // true for admin, false otherwise
+      isActive: true,
+      hasPlayed: false     // NEW: track whether this player has played yet
     };
 
     rooms[roomId].players.push(newPlayer);
     socket.join(roomId);
     console.log(`Player ${playerName} joined room ${roomId}`);
 
-    // --- NEW/UPDATED LINES:
-    // Emit the grid size to the new client so that its board matches the admin’s settings.
+    // Send the gridSize to the new client so its board matches.
     socket.emit('gridSizeUpdate', rooms[roomId].gridSize);
-    // -------------------------
-
-    // Broadcast the updated players list.
+    
+    // Broadcast updated players list.
     io.to(roomId).emit('playerListUpdate', rooms[roomId].players);
 
     // Broadcast a system chat message.
@@ -63,12 +208,57 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Optional: Allow the admin to update the grid size (if needed) and broadcast to all players.
+  // Allow the admin to update the grid size.
   socket.on('setGridSize', (data) => {
     const { roomId, gridSize } = data;
     if (rooms[roomId]) {
       rooms[roomId].gridSize = gridSize;
       io.to(roomId).emit('gridSizeUpdate', gridSize);
+    }
+  });
+
+  // When the admin starts the game, initialize the board and state.
+  socket.on('gameStart', (data) => {
+    const { roomId } = data;
+    const room = rooms[roomId];
+    if (room) {
+      initializeGame(room);
+      io.to(roomId).emit('updateGameState', {
+        board: room.board,
+        currentTurn: room.players[room.currentTurn].id,
+        players: room.players,
+        winner: null
+      });
+    }
+  });
+
+  // When a move is made, process it on the server.
+  socket.on('makeMove', (data) => {
+    const { roomId, row, col } = data;
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+    const result = processMove(room, socket.id, row, col);
+    if (result.error) {
+      socket.emit('errorMessage', result.error);
+    } else {
+      // Broadcast the updated game state to everyone in the room.
+      io.to(roomId).emit('updateGameState', result);
+    }
+  });
+
+  // Reset the game state for a “play again” request.
+  socket.on('playAgain', (data) => {
+    const { roomId } = data;
+    const room = rooms[roomId];
+    if (room) {
+      room.players.forEach(p => p.isActive = true);
+      initializeGame(room);
+      io.to(roomId).emit('updateGameState', {
+        board: room.board,
+        currentTurn: room.players[room.currentTurn].id,
+        players: room.players,
+        winner: null
+      });
     }
   });
 
