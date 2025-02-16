@@ -53,13 +53,10 @@ function processMove(room, playerSocketId, row, col) {
   if (!room.gameStarted) {
     return { error: "Game is not active" };
   }
-  // Check if it is the turn of the player who sent the move.
   let currentPlayer = room.players[room.currentTurn];
   if (currentPlayer.id !== playerSocketId) {
     return { error: "Not your turn" };
   }
-
-  // Validate the move: the cell must be either empty or already owned by the current player.
   let cell = room.board[row][col];
   if (cell.owner !== null && cell.owner !== playerSocketId) {
     return { error: "Invalid move" };
@@ -68,10 +65,11 @@ function processMove(room, playerSocketId, row, col) {
   // Place an orb into the cell.
   cell.count += 1;
   cell.owner = playerSocketId;
-
-  // Mark that the current player has now played.
   currentPlayer.hasPlayed = true;
-  
+
+  // Save the last move in the room state.
+  room.lastMove = { row, col };
+
   // Process chain reactions using a queue.
   let queue = [];
   if (cell.count >= getCriticalMass(row, col, room.gridSize)) {
@@ -151,9 +149,11 @@ function processMove(room, playerSocketId, row, col) {
     board: room.board,
     currentTurn: room.players[room.currentTurn].id,
     players: room.players,
-    winner: winner
+    winner: winner,
+    lastMove: room.lastMove  
   };
-}
+  };
+
 
 // ---------------------
 // Socket.io Event Handlers
