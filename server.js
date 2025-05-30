@@ -53,10 +53,18 @@ function processMove(room, playerSocketId, row, col) {
   if (!room.gameStarted) {
     return { error: "Game is not active" };
   }
+  
   let currentPlayer = room.players[room.currentTurn];
   if (currentPlayer.id !== playerSocketId) {
     return { error: "Not your turn" };
   }
+  
+  // Check if the player is a spectator
+  const player = room.players.find(p => p.id === playerSocketId);
+  if (player && player.isSpectator) {
+    return { error: "Spectators cannot make moves" };
+  }
+  
   let cell = room.board[row][col];
   if (cell.owner !== null && cell.owner !== playerSocketId) {
     return { error: "Invalid move" };
@@ -122,32 +130,37 @@ function processMove(room, playerSocketId, row, col) {
         }
       }
     }
-  }
-  
-  // Check for win condition only if at least two players have played.
-  let playersWhoPlayed = room.players.filter(p => p.hasPlayed);
+  }  // Check for win condition only if all non-spectator players have played at least once
+  let nonSpectatorPlayers = room.players.filter(p => !p.isSpectator);
+  let playersWhoPlayed = nonSpectatorPlayers.filter(p => p.hasPlayed);
   let winner = null;
-  if (playersWhoPlayed.length > 1) {
-    let activePlayers = room.players.filter(p => p.isActive);
+  
+  // Only check for winner if all non-spectator players have had a turn
+  if (playersWhoPlayed.length === nonSpectatorPlayers.length && nonSpectatorPlayers.length > 1) {
+    // Only count non-spectator active players for win condition
+    let activePlayers = room.players.filter(p => p.isActive && !p.isSpectator);
     if (activePlayers.length === 1) {
       winner = activePlayers[0];
       room.gameStarted = false;
     }
   }
   
-  // Update turn: advance to the next active player.
-  let nextTurn = room.currentTurn;
-  for (let i = 0; i < room.players.length; i++) {
-    nextTurn = (nextTurn + 1) % room.players.length;
-    if (room.players[nextTurn].isActive) {
-      break;
+  // Only update turn if the game hasn't ended
+  if (!winner) {
+    // Update turn: advance to the next active, non-spectator player.
+    let nextTurn = room.currentTurn;
+    for (let i = 0; i < room.players.length; i++) {
+      nextTurn = (nextTurn + 1) % room.players.length;
+      if (room.players[nextTurn].isActive && !room.players[nextTurn].isSpectator) {
+        break;
+      }
     }
+    room.currentTurn = nextTurn;
   }
-  room.currentTurn = nextTurn;
   
   return {
     board: room.board,
-    currentTurn: room.players[room.currentTurn].id,
+    currentTurn: winner ? null : room.players[room.currentTurn].id, // Don't return currentTurn if game is over
     players: room.players,
     winner: winner,
     lastMove: room.lastMove  
@@ -179,15 +192,14 @@ io.on('connection', (socket) => {
     // Prevent duplicate joining.
     if (rooms[roomId].players.find(p => p.id === socket.id)) {
       return;
-    }
-
-    // Create a new player object.
+    }    // Create a new player object.
     const newPlayer = {
       id: socket.id,
       name: playerName,
       isAdmin: !!isAdmin,  // true for admin, false otherwise
       isActive: true,
-      hasPlayed: false     // NEW: track whether this player has played yet
+      hasPlayed: false,    // NEW: track whether this player has played yet
+      isSpectator: rooms[roomId].gameStarted  // If game is already started, they're a spectator
     };
 
     rooms[roomId].players.push(newPlayer);
@@ -202,7 +214,7 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('chatMessage', {
       id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
       playerId: 'Server',
-      text: `${playerName} has joined the room.`,
+      text: `${playerName} has joined the room${newPlayer.isSpectator ? ' as a spectator' : ''}.`,
       timestamp: new Date()
     });
   });
@@ -230,12 +242,14 @@ io.on('connection', (socket) => {
       });
     }
   });
-
   // When a move is made, process it on the server.
   socket.on('makeMove', (data) => {
     const { roomId, row, col } = data;
     const room = rooms[roomId];
-    if (!room || !room.gameStarted) return;
+    if (!room || !room.gameStarted) {
+      console.log('Move blocked: room not found or game not started');
+      return;
+    }
     const result = processMove(room, socket.id, row, col);
     if (result.error) {
       socket.emit('errorMessage', result.error);
@@ -254,12 +268,11 @@ io.on('connection', (socket) => {
       if (!requestingPlayer || !requestingPlayer.isAdmin) {
         socket.emit('errorMessage', 'Only admin can restart the game');
         return;
-      }
-
-      // Reset all player states properly but preserve player order and attributes
+      }      // Reset all player states properly but preserve player order and attributes
       room.players.forEach(p => {
         p.isActive = true;
         p.hasPlayed = false;
+        p.isSpectator = false; // Convert all spectators to players for the new round
       });
       
       // Clear the last move
@@ -290,7 +303,7 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('chatMessage', {
         id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
         playerId: 'Server',
-        text: 'Game has been restarted. Good luck!',
+        text: 'Game has been restarted. All spectators can now participate. Good luck!',
         timestamp: new Date()
       });
     }
