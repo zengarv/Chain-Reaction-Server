@@ -102,7 +102,7 @@ function processMove(room, playerSocketId, row, col) {
     }
   }
   
-  // Update each player’s "active" status.
+  // Update each player's "active" status.
   // For players who haven't played yet, consider them active by default.
   room.players.forEach(player => {
     if (!player.hasPlayed) {
@@ -198,10 +198,9 @@ io.on('connection', (socket) => {
     socket.emit('gridSizeUpdate', rooms[roomId].gridSize);
     
     // Broadcast updated players list.
-    io.to(roomId).emit('playerListUpdate', rooms[roomId].players);
-
-    // Broadcast a system chat message.
+    io.to(roomId).emit('playerListUpdate', rooms[roomId].players);    // Broadcast a system chat message.
     io.to(roomId).emit('chatMessage', {
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
       playerId: 'Server',
       text: `${playerName} has joined the room.`,
       timestamp: new Date()
@@ -245,26 +244,61 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('updateGameState', result);
     }
   });
-
-  // Reset the game state for a “play again” request.
+  // Reset the game state for a "play again" request.
   socket.on('playAgain', (data) => {
     const { roomId } = data;
     const room = rooms[roomId];
     if (room) {
-      room.players.forEach(p => p.isActive = true);
-      initializeGame(room);
+      // Check if the requesting player is an admin
+      const requestingPlayer = room.players.find(p => p.id === socket.id);
+      if (!requestingPlayer || !requestingPlayer.isAdmin) {
+        socket.emit('errorMessage', 'Only admin can restart the game');
+        return;
+      }
+
+      // Reset all player states properly but preserve player order and attributes
+      room.players.forEach(p => {
+        p.isActive = true;
+        p.hasPlayed = false;
+      });
+      
+      // Clear the last move
+      room.lastMove = null;
+      
+      // Reset only the board, don't call initializeGame to avoid changing other state
+      const { rows, cols } = room.gridSize;
+      room.board = [];
+      for (let i = 0; i < rows; i++) {
+        room.board[i] = [];
+        for (let j = 0; j < cols; j++) {
+          room.board[i][j] = { count: 0, owner: null };
+        }
+      }
+      
+      // Reset turn to first player but keep game started
+      room.currentTurn = 0;
+      room.gameStarted = true; // Ensure game is marked as started
+      
+      // Broadcast the reset state to all players
       io.to(roomId).emit('updateGameState', {
         board: room.board,
         currentTurn: room.players[room.currentTurn].id,
         players: room.players,
-        winner: null
+        winner: null,
+        lastMove: null
+      });      // Send a chat message to indicate the game has restarted
+      io.to(roomId).emit('chatMessage', {
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+        playerId: 'Server',
+        text: 'Game has been restarted. Good luck!',
+        timestamp: new Date()
       });
     }
   });
-
   socket.on('sendChatMessage', (data) => {
     const { roomId, message, playerName } = data;
     io.to(roomId).emit('chatMessage', {
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
       playerId: socket.id,
       text: `${playerName}: ${message}`,
       timestamp: new Date()
@@ -277,9 +311,9 @@ io.on('connection', (socket) => {
       const room = rooms[roomId];
       const index = room.players.findIndex(p => p.id === socket.id);
       if (index !== -1) {
-        const removedPlayer = room.players.splice(index, 1)[0];
-        io.to(roomId).emit('playerListUpdate', room.players);
+        const removedPlayer = room.players.splice(index, 1)[0];        io.to(roomId).emit('playerListUpdate', room.players);
         io.to(roomId).emit('chatMessage', {
+          id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
           playerId: 'Server',
           text: `${removedPlayer.name} has left the room.`,
           timestamp: new Date()
