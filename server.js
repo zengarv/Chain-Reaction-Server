@@ -15,8 +15,11 @@ const io = new Server(server, {
 
 // In‑memory storage for rooms. Each room now has players, gridSize,
 // board (a 2D array of cell objects), currentTurn (index into players),
-// and a gameStarted flag.
+// gameStarted flag, timer settings, and timer state.
 const rooms = {};
+
+// Store active timers for each room
+const roomTimers = {};
 
 // ---------------------
 // Helper Functions
@@ -47,9 +50,92 @@ function getCriticalMass(row, col, gridSize) {
   return count;
 }
 
+// Clear any existing timer for a room
+function clearRoomTimer(roomId) {
+  if (roomTimers[roomId]) {
+    clearTimeout(roomTimers[roomId].timeoutId);
+    clearInterval(roomTimers[roomId].intervalId);
+    delete roomTimers[roomId];
+  }
+}
+
+// Start timer for current player's turn
+function startTurnTimer(roomId) {
+  const room = rooms[roomId];
+  if (!room || !room.gameStarted || !room.timerSettings) return;
+
+  // Clear any existing timer
+  clearRoomTimer(roomId);
+
+  const timerDuration = room.timerSettings.duration * 1000; // Convert to milliseconds
+  let timeLeft = room.timerSettings.duration;
+
+  // Emit initial timer state
+  io.to(roomId).emit('timerUpdate', { timeLeft, isActive: true });
+
+  // Update timer every second
+  const intervalId = setInterval(() => {
+    timeLeft--;
+    io.to(roomId).emit('timerUpdate', { timeLeft, isActive: true });
+    
+    if (timeLeft <= 0) {
+      clearInterval(intervalId);
+    }
+  }, 1000);
+
+  // Set timeout for when timer expires
+  const timeoutId = setTimeout(() => {
+    clearInterval(intervalId);
+    
+    // Skip current player's turn
+    skipPlayerTurn(roomId);
+    
+    io.to(roomId).emit('timerUpdate', { timeLeft: 0, isActive: false });
+    io.to(roomId).emit('chatMessage', {
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+      playerId: 'Server',
+      text: `${room.players[room.currentTurn].name}'s turn was skipped due to timeout.`,
+      timestamp: new Date()
+    });
+  }, timerDuration);
+
+  roomTimers[roomId] = { timeoutId, intervalId };
+}
+
+// Skip current player's turn and advance to next player
+function skipPlayerTurn(roomId) {
+  const room = rooms[roomId];
+  if (!room || !room.gameStarted) return;
+
+  // Clear timer
+  clearRoomTimer(roomId);
+
+  // Advance to next active, non-spectator player
+  let nextTurn = room.currentTurn;
+  for (let i = 0; i < room.players.length; i++) {
+    nextTurn = (nextTurn + 1) % room.players.length;
+    if (room.players[nextTurn].isActive && !room.players[nextTurn].isSpectator) {
+      break;
+    }
+  }
+  room.currentTurn = nextTurn;
+
+  // Broadcast updated game state
+  io.to(roomId).emit('updateGameState', {
+    board: room.board,
+    currentTurn: room.players[room.currentTurn].id,
+    players: room.players,
+    winner: null,
+    lastMove: room.lastMove
+  });
+
+  // Start timer for next player
+  startTurnTimer(roomId);
+}
+
 // Process a move in a room. (Only the current player may make a move,
 // and a move is valid only if the targeted cell is either empty or already owned.)
-function processMove(room, playerSocketId, row, col) {
+function processMove(room, playerSocketId, row, col, roomId) {
   if (!room.gameStarted) {
     return { error: "Game is not active" };
   }
@@ -144,9 +230,11 @@ function processMove(room, playerSocketId, row, col) {
       room.gameStarted = false;
     }
   }
-  
-  // Only update turn if the game hasn't ended
+    // Only update turn if the game hasn't ended
   if (!winner) {
+    // Clear any existing timer first
+    clearRoomTimer(roomId);
+    
     // Update turn: advance to the next active, non-spectator player.
     let nextTurn = room.currentTurn;
     for (let i = 0; i < room.players.length; i++) {
@@ -156,6 +244,9 @@ function processMove(room, playerSocketId, row, col) {
       }
     }
     room.currentTurn = nextTurn;
+  } else {
+    // Game ended, clear timer
+    clearRoomTimer(roomId);
   }
   
   return {
@@ -168,21 +259,21 @@ function processMove(room, playerSocketId, row, col) {
   };
 
 
+
 // ---------------------
 // Socket.io Event Handlers
 // ---------------------
 
 io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
-
-  socket.on('joinRoom', (data) => {
+  console.log('New client connected:', socket.id);  socket.on('joinRoom', (data) => {
     
-    const { roomId, playerName, isAdmin, gridSize } = data;
+    const { roomId, playerName, isAdmin, gridSize, timerSettings } = data;
     if (!rooms[roomId]) {
       // If the room is new, initialize it with default grid settings.
       rooms[roomId] = {
         players: [],
         gridSize: gridSize || { rows: 9, cols: 6 },
+        timerSettings: timerSettings || { duration: 20 }, // Default 20 second timer
         board: [],
         currentTurn: 0,
         gameStarted: false
@@ -227,7 +318,6 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('gridSizeUpdate', gridSize);
     }
   });
-
   // When the admin starts the game, initialize the board and state.
   socket.on('gameStart', (data) => {
     const { roomId } = data;
@@ -240,9 +330,11 @@ io.on('connection', (socket) => {
         players: room.players,
         winner: null
       });
+      
+      // Start the timer for the first player
+      startTurnTimer(roomId);
     }
-  });
-  // When a move is made, process it on the server.
+  });  // When a move is made, process it on the server.
   socket.on('makeMove', (data) => {
     const { roomId, row, col } = data;
     const room = rooms[roomId];
@@ -250,14 +342,20 @@ io.on('connection', (socket) => {
       console.log('Move blocked: room not found or game not started');
       return;
     }
-    const result = processMove(room, socket.id, row, col);
+    const result = processMove(room, socket.id, row, col, roomId);
     if (result.error) {
       socket.emit('errorMessage', result.error);
     } else {
       // Broadcast the updated game state to everyone in the room.
       io.to(roomId).emit('updateGameState', result);
+      
+      // Start timer for the next player if game is still ongoing
+      if (!result.winner && result.currentTurn) {
+        startTurnTimer(roomId);
+      }
     }
   });
+
   // Reset the game state for a "play again" request.
   socket.on('playAgain', (data) => {
     const { roomId } = data;
@@ -268,7 +366,12 @@ io.on('connection', (socket) => {
       if (!requestingPlayer || !requestingPlayer.isAdmin) {
         socket.emit('errorMessage', 'Only admin can restart the game');
         return;
-      }      // Reset all player states properly but preserve player order and attributes
+      }
+
+      // Clear any existing timer
+      clearRoomTimer(roomId);
+
+      // Reset all player states properly but preserve player order and attributes
       room.players.forEach(p => {
         p.isActive = true;
         p.hasPlayed = false;
@@ -299,15 +402,21 @@ io.on('connection', (socket) => {
         players: room.players,
         winner: null,
         lastMove: null
-      });      // Send a chat message to indicate the game has restarted
+      });
+
+      // Send a chat message to indicate the game has restarted
       io.to(roomId).emit('chatMessage', {
         id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
         playerId: 'Server',
         text: 'Game has been restarted. All spectators can now participate. Good luck!',
         timestamp: new Date()
       });
+
+      // Start timer for the first player
+      startTurnTimer(roomId);
     }
   });
+
   socket.on('sendChatMessage', (data) => {
     const { roomId, message, playerName } = data;
     io.to(roomId).emit('chatMessage', {
@@ -320,18 +429,34 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
+    
+    // Clear any timers for rooms where this player was playing
     for (const roomId in rooms) {
       const room = rooms[roomId];
-      const index = room.players.findIndex(p => p.id === socket.id);
-      if (index !== -1) {
-        const removedPlayer = room.players.splice(index, 1)[0];        io.to(roomId).emit('playerListUpdate', room.players);
+      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      if (playerIndex !== -1) {
+        const removedPlayer = room.players.splice(playerIndex, 1)[0];
+        
+        // If the disconnected player was the current player, clear timer and skip turn
+        if (room.gameStarted && room.players[room.currentTurn]?.id === socket.id) {
+          clearRoomTimer(roomId);
+          // Skip to next player if game is still ongoing
+          if (room.players.length > 0) {
+            skipPlayerTurn(roomId);
+          }
+        }
+
+        io.to(roomId).emit('playerListUpdate', room.players);
         io.to(roomId).emit('chatMessage', {
           id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
           playerId: 'Server',
           text: `${removedPlayer.name} has left the room.`,
           timestamp: new Date()
         });
+        
         if (room.players.length === 0) {
+          // Clear timer when room is empty
+          clearRoomTimer(roomId);
           delete rooms[roomId];
         }
       }
