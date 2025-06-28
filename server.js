@@ -417,6 +417,37 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Allow the admin to shuffle the player order
+  socket.on('shufflePlayers', (data) => {
+    const { roomId } = data;
+    const room = rooms[roomId];
+    if (room && !room.gameStarted) {
+      // Check if the requesting player is an admin
+      const requestingPlayer = room.players.find(p => p.id === socket.id);
+      if (!requestingPlayer || !requestingPlayer.isAdmin) {
+        socket.emit('errorMessage', 'Only admin can shuffle players');
+        return;
+      }
+
+      // Shuffle the players array using Fisher-Yates shuffle algorithm
+      for (let i = room.players.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [room.players[i], room.players[j]] = [room.players[j], room.players[i]];
+      }
+      
+      // Broadcast updated players list
+      io.to(roomId).emit('playerListUpdate', room.players);
+      
+      // Send a chat message to indicate the players have been shuffled
+      io.to(roomId).emit('chatMessage', {
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+        playerId: 'Server',
+        text: 'Player order has been shuffled by the admin.',
+        timestamp: new Date()
+      });
+    }
+  });
+
   socket.on('sendChatMessage', (data) => {
     const { roomId, message, playerName } = data;
     io.to(roomId).emit('chatMessage', {
